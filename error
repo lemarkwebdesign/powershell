@@ -1,0 +1,22 @@
+At C:\Users\M182585-PPA\Desktop\ScriptCopyFiles\Copy-FileToDevices.ps1:52 char:81
++ ... piujÄ™ '$LocalFileName' do $($Devices.Count) urzÄ…dzeÅ„ (1 po drugim) ...
++                                                                ~~
+Unexpected token 'po' in expression or statement.
+At C:\Users\M182585-PPA\Desktop\ScriptCopyFiles\Copy-FileToDevices.ps1:52 char:80
++ ...  kopiujÄ™ '$LocalFileName' do $($Devices.Count) urzÄ…dzeÅ„ (1 po drug ...
++                                                                  ~
+Missing closing ')' in expression.
+At C:\Users\M182585-PPA\Desktop\ScriptCopyFiles\Copy-FileToDevices.ps1:52 char:90
++ ... $LocalFileName' do $($Devices.Count) urzÄ…dzeÅ„ (1 po drugim)..." -Fo ...
++                                                                 ~
+Unexpected token ')' in expression or statement.
+At C:\Users\M182585-PPA\Desktop\ScriptCopyFiles\Copy-FileToDevices.ps1:93 char:5
++     }
++     ~
+Unexpected token '}' in expression or statement.
+At C:\Users\M182585-PPA\Desktop\ScriptCopyFiles\Copy-FileToDevices.ps1:116 char:1
++ }
++ ~
+Unexpected token '}' in expression or statement.
+    + CategoryInfo          : ParserError: (:) [], ParseException
+    + FullyQualifiedErrorId : UnexpectedToken
