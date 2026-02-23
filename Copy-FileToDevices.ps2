@@ -18,6 +18,23 @@ function ConvertTo-PlainText([Security.SecureString]$Secure) {
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 }
 
+function Convert-UnitToBytes {
+    param(
+        [double]$Value,
+        [string]$Unit
+    )
+    switch -Regex ($Unit) {
+        '^(B)$'  { return [long]($Value) }
+        '^(kB|KB)$' { return [long]($Value * 1000) }
+        '^(KiB)$'   { return [long]($Value * 1024) }
+        '^(MB)$'    { return [long]($Value * 1000 * 1000) }
+        '^(MiB)$'   { return [long]($Value * 1024 * 1024) }
+        '^(GB)$'    { return [long]($Value * 1000 * 1000 * 1000) }
+        '^(GiB)$'   { return [long]($Value * 1024 * 1024 * 1024) }
+        default { return 0 }
+    }
+}
+
 function Invoke-PscpWithLiveProgress {
     param(
         [string]$PscpPath,
@@ -28,14 +45,14 @@ function Invoke-PscpWithLiveProgress {
         [string]$LocalPath,
         [string]$RemotePath,
         [string]$Protocol,
-        [string]$ActivityLabel
+        [string]$ActivityLabel,
+        [long]$TotalBytes
     )
 
-    # Note:
-    # - We do NOT use -batch because we want to auto-answer "Store key in cache?"
-    # - Progress/statistics are typically written to STDERR by PuTTY tools.
+    # NOTE:
+    # - No -batch: we auto-answer "Store key in cache? (y/n)" by writing "y" to stdin.
+    # - PuTTY progress often updates using carriage returns (\r) without newlines.
     $args = New-Object System.Collections.Generic.List[string]
-    $args.Add("-v")
     $args.Add("-no-sanitise-stderr")
     $args.Add("-P");  $args.Add("$Port")
     $args.Add("-l");  $args.Add($Username)
@@ -61,46 +78,86 @@ function Invoke-PscpWithLiveProgress {
     $p.StandardInput.WriteLine("y")
     $p.StandardInput.Flush()
 
-    $stderrLines = New-Object System.Collections.Generic.List[string]
-    $stdoutAll = ""
-
-    # Read STDERR asynchronously line-by-line to update progress
     $stderrReader = $p.StandardError
     $stdoutReader = $p.StandardOutput
 
+    $stderrAll = New-Object System.Text.StringBuilder
+    $stdoutAll = ""
+
     $percent = 0
     $speedText = ""
+    $transferredBytes = 0
 
-    # Common PuTTY progress line often contains "...  12%  1.2 MB/s"
-    $rxPct   = [regex]"(?i)\b(?<pct>\d{1,3})%\b"
-    $rxSpeed = [regex]"(?i)\b(?<spd>\d+(?:\.\d+)?)\s*(?<unit>kB/s|KB/s|MB/s|GB/s|B/s)\b"
+    # Patterns:
+    # 1) percent (if present)
+    $rxPct = [regex]"(?i)\b(?<pct>\d{1,3})%\b"
 
-    # Loop until process exits; poll readers
+    # 2) speed (kB/s, KiB/s, MB/s, MiB/s, etc.)
+    $rxSpeed = [regex]"(?i)\b(?<spd>\d+(?:\.\d+)?)\s*(?<unit>kB/s|KB/s|KiB/s|MB/s|MiB/s|GB/s|GiB/s|B/s)\b"
+
+    # 3) transferred size (avoid /s)
+    $rxXfer = [regex]"(?i)\b(?<xfer>\d+(?:\.\d+)?)\s*(?<unit>kB|KB|KiB|MB|MiB|GB|GiB|B)\b(?!/s)"
+
+    # Read STDERR character-by-character to handle \r updates.
+    $current = New-Object System.Text.StringBuilder
+
     while (-not $p.HasExited) {
-        # Read any available stderr lines
         while (-not $stderrReader.EndOfStream) {
-            $line = $stderrReader.ReadLine()
-            if ($null -ne $line) {
-                $stderrLines.Add($line) | Out-Null
+            $ch = $stderrReader.Read()
+            if ($ch -lt 0) { break }
+            $c = [char]$ch
 
-                # Parse percent
-                $m1 = $rxPct.Match($line)
-                if ($m1.Success) {
-                    $pctVal = [int]$m1.Groups["pct"].Value
-                    if ($pctVal -ge 0 -and $pctVal -le 100) { $percent = $pctVal }
+            # Append everything to full stderr (for logs)
+            [void]$stderrAll.Append($c)
+
+            if ($c -eq "`r" -or $c -eq "`n") {
+                $line = $current.ToString()
+                $current.Clear() | Out-Null
+
+                if (-not [string]::IsNullOrWhiteSpace($line)) {
+                    # Parse percent
+                    $m1 = $rxPct.Match($line)
+                    if ($m1.Success) {
+                        $pctVal = [int]$m1.Groups["pct"].Value
+                        if ($pctVal -ge 0 -and $pctVal -le 100) { $percent = $pctVal }
+                    }
+
+                    # Parse speed
+                    $m2 = $rxSpeed.Match($line)
+                    if ($m2.Success) {
+                        $speedText = "$($m2.Groups['spd'].Value) $($m2.Groups['unit'].Value)"
+                    }
+
+                    # Parse transferred size (best effort)
+                    # Take the largest parsed transferred amount from the line to avoid grabbing small unrelated numbers.
+                    $bestBytes = $null
+                    foreach ($m in $rxXfer.Matches($line)) {
+                        $val = [double]$m.Groups["xfer"].Value
+                        $unit = $m.Groups["unit"].Value
+                        $b = Convert-UnitToBytes -Value $val -Unit $unit
+                        if ($b -gt 0 -and (($bestBytes -eq $null) -or ($b -gt $bestBytes))) {
+                            $bestBytes = $b
+                        }
+                    }
+                    if ($bestBytes -ne $null) {
+                        $transferredBytes = [long]$bestBytes
+                        if ($TotalBytes -gt 0) {
+                            $calcPct = [int][math]::Floor(([double]$transferredBytes / [double]$TotalBytes) * 100)
+                            if ($calcPct -gt $percent) { $percent = [math]::Min(100, $calcPct) }
+                        }
+                    }
+
+                    $statusLine = if ($speedText) {
+                        "Progress: $percent% | Speed: $speedText"
+                    } else {
+                        "Progress: $percent%"
+                    }
+
+                    Write-Progress -Activity $ActivityLabel -Status $statusLine -PercentComplete $percent
                 }
-
-                # Parse speed
-                $m2 = $rxSpeed.Match($line)
-                if ($m2.Success) {
-                    $speedText = "$($m2.Groups['spd'].Value) $($m2.Groups['unit'].Value)"
-                }
-
-                # Update progress bar
-                $statusLine = if ($speedText) { "Progress: $percent% | Speed: $speedText" } else { "Progress: $percent%" }
-                Write-Progress -Activity $ActivityLabel -Status $statusLine -PercentComplete $percent
-            } else {
-                break
+            }
+            else {
+                [void]$current.Append($c)
             }
         }
 
@@ -108,28 +165,27 @@ function Invoke-PscpWithLiveProgress {
     }
 
     # Drain remaining output
-    try {
-        $stdoutAll = $stdoutReader.ReadToEnd()
-    } catch { }
+    try { $stdoutAll = $stdoutReader.ReadToEnd() } catch { }
 
     try {
         while (-not $stderrReader.EndOfStream) {
-            $line = $stderrReader.ReadLine()
-            if ($null -ne $line) { $stderrLines.Add($line) | Out-Null }
+            $ch = $stderrReader.Read()
+            if ($ch -lt 0) { break }
+            [void]$stderrAll.Append([char]$ch)
         }
     } catch { }
 
     $p.WaitForExit()
-
     Write-Progress -Activity $ActivityLabel -Completed
 
     [pscustomobject]@{
-        ExitCode = $p.ExitCode
-        StdOut   = $stdoutAll
-        StdErr   = ($stderrLines -join "`n")
-        LastPct  = $percent
-        LastSpeed= $speedText
-        Args     = $psi.Arguments
+        ExitCode       = $p.ExitCode
+        StdOut         = $stdoutAll
+        StdErr         = $stderrAll.ToString()
+        LastPct        = $percent
+        LastSpeed      = $speedText
+        Transferred    = $transferredBytes
+        Args           = $psi.Arguments
     }
 }
 
@@ -151,17 +207,18 @@ $Devices = @(
         Where-Object { $_ -and -not $_.StartsWith("#") } |
         Sort-Object -Unique
 )
-
 if ($Devices.Count -eq 0) { throw "No devices found in $DevicesPath" }
 
 # Prompt once for credentials
 $Username   = Read-Host "Enter SSH username"
 $SecurePass = Read-Host "Enter SSH password (will be passed to pscp -pw)" -AsSecureString
 $Password   = ConvertTo-PlainText $SecurePass
-
 if ([string]::IsNullOrWhiteSpace($Username) -or [string]::IsNullOrWhiteSpace($Password)) {
     throw "Username/password cannot be empty."
 }
+
+# Total size for percent calculation
+$TotalBytes = (Get-Item -LiteralPath $LocalPath).Length
 
 # Logging
 $RunStamp = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -175,7 +232,7 @@ $results = New-Object System.Collections.Generic.List[object]
 
 Write-Host "Starting copy to $($Devices.Count) devices (sequential)..." -ForegroundColor Cyan
 Write-Host "Protocol   : $Protocol"
-Write-Host "Local file : $LocalPath"
+Write-Host "Local file : $LocalPath ($TotalBytes bytes)"
 Write-Host "Remote path: $RemotePath"
 Write-Host "Output dir : $OutDir"
 Write-Host ""
@@ -184,7 +241,6 @@ $index = 0
 foreach ($Device in $Devices) {
     $index++
     $start = Get-Date
-
     Write-Host "[$($start.ToString('HH:mm:ss'))] ($index/$($Devices.Count)) $Device"
 
     $status = "UNKNOWN"
@@ -202,7 +258,8 @@ foreach ($Device in $Devices) {
         $r = Invoke-PscpWithLiveProgress -PscpPath $PscpPath -Device $Device -Port $Port `
                                          -Username $Username -Password $Password `
                                          -LocalPath $LocalPath -RemotePath $RemotePath `
-                                         -Protocol $Protocol -ActivityLabel $activity
+                                         -Protocol $Protocol -ActivityLabel $activity `
+                                         -TotalBytes $TotalBytes
 
         $exit = $r.ExitCode
         $stderrFinal = $r.StdErr
