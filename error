@@ -1,18 +1,1 @@
-[12:44:41] 10.50.156.134 ...pscp: unknown option "-timeout"
-      try typing just "pscp" for help
- FAILED
-[12:44:43] 10.50.156.135 ...pscp: unknown option "-timeout"
-      try typing just "pscp" for help
- FAILED
-[12:44:45] 10.50.156.136 ...pscp: unknown option "-timeout"
-      try typing just "pscp" for help
- FAILED
-[12:44:48] 10.50.156.137 ...pscp: unknown option "-timeout"
-      try typing just "pscp" for help
- FAILED
-The property 'Count' cannot be found on this object. Verify that the property exists.
-At C:\Users\M182585-PPA\Desktop\ScriptCopyFiles\Copy-FileToDevices.ps1:126 char:1
-+ $ok   = ($results | Where-Object status -eq "OK").Count
-+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : NotSpecified: (:) [], ParentContainsErrorRecordException
-    + FullyQualifiedErrorId : PropertyNotFoundStrict
+                                                                                                                      [12:49:06] 10.50.156.134 ...The server's host key is not cached. You have no guarantee                                  that the server is the computer you think it is.                                                                        The server's ssh-ed25519 key fingerprint is:                                                                            ssh-ed25519 255 SHA256:+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXx                                                      Connection abandoned.                                                                                                   Lost connection       
