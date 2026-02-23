@@ -8,10 +8,12 @@ $DevicesFileName = "devices.txt"          # one IP/host per line
 $LocalFileName   = "payload.bin"          # file located in the script folder
 $RemotePath      = "/var/tmp/payload.bin" # destination path on the device
 $PscpPath        = "pscp.exe"             # or full path e.g. C:\Tools\PuTTY\pscp.exe
-$ConnectTimeout  = 10                     # seconds
+
+# Optional: if you want to pin host key (recommended), set to the expected fingerprint string.
+# Example value format depends on PuTTY version, leave $null to disable.
+$HostKey = $null
 # =========================
 
-# Resolve paths relative to the script location
 $ScriptDir   = Split-Path -Parent $PSCommandPath
 $DevicesPath = Join-Path $ScriptDir $DevicesFileName
 $LocalPath   = Join-Path $ScriptDir $LocalFileName
@@ -19,11 +21,9 @@ $LocalPath   = Join-Path $ScriptDir $LocalFileName
 if (-not (Test-Path -LiteralPath $DevicesPath)) { throw "Missing devices list file: $DevicesPath" }
 if (-not (Test-Path -LiteralPath $LocalPath))   { throw "Missing local file to copy: $LocalPath" }
 
-# Verify pscp exists
 try { $null = Get-Command $PscpPath -ErrorAction Stop }
 catch { throw "pscp.exe not found. Add PuTTY to PATH or set `$PscpPath` to a full path." }
 
-# Load devices (ignore empty lines and lines starting with #)
 $Devices = Get-Content -LiteralPath $DevicesPath |
     ForEach-Object { $_.Trim() } |
     Where-Object { $_ -and -not $_.StartsWith("#") } |
@@ -31,7 +31,6 @@ $Devices = Get-Content -LiteralPath $DevicesPath |
 
 if (-not $Devices -or $Devices.Count -eq 0) { throw "No devices found in $DevicesPath" }
 
-# Prompt once for credentials
 $Username   = Read-Host "Enter SSH username"
 $SecurePass = Read-Host "Enter SSH password (will be passed to pscp -pw)" -AsSecureString
 $Password   = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
@@ -42,7 +41,6 @@ if ([string]::IsNullOrWhiteSpace($Username) -or [string]::IsNullOrWhiteSpace($Pa
     throw "Username/password cannot be empty."
 }
 
-# Output logs
 $RunStamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $OutDir   = Join-Path $ScriptDir "out_$RunStamp"
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
@@ -67,18 +65,23 @@ foreach ($Device in $Devices) {
     $exitCode = $null
 
     try {
-        # Optional: quick port 22 test
+        # Optional: quick port 22 test (if blocked, skip faster)
         $t = Test-NetConnection -ComputerName $Device -Port 22 -WarningAction SilentlyContinue
         if (-not $t.TcpTestSucceeded) {
             throw "Port 22 unreachable"
         }
 
-        # Build pscp arguments
         $args = @(
-            "-batch",                  # no interactive prompts
-            "-pw", $Password,          # WARNING: password in process arguments (accepted by user)
-            "-l",  $Username,
-            "-timeout", "$ConnectTimeout",
+            "-batch",
+            "-pw", $Password,
+            "-l",  $Username
+        )
+
+        if ($HostKey) {
+            $args += @("-hostkey", $HostKey)
+        }
+
+        $args += @(
             $LocalPath,
             "$Device`:$RemotePath"
         )
@@ -123,8 +126,9 @@ foreach ($Device in $Devices) {
 
 $results | Export-Csv -NoTypeInformation -Encoding UTF8 -LiteralPath $CsvPath
 
-$ok   = ($results | Where-Object status -eq "OK").Count
-$fail = ($results | Where-Object status -ne "OK").Count
+# Safe counting under StrictMode
+$ok   = @($results | Where-Object { $_.status -eq "OK" }).Count
+$fail = @($results | Where-Object { $_.status -ne "OK" }).Count
 
 Write-Host ""
 Write-Host "DONE. OK=$ok FAILED=$fail" -ForegroundColor Cyan
