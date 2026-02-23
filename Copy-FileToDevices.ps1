@@ -1,99 +1,104 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ======= USTAWIENIA =======
-$DevicesFileName = "devices.txt"        # IP/host 1 na linię
-$LocalFileName   = "payload.bin"        # plik w folderze skryptu
-$RemotePath      = "/var/tmp/payload.bin"
-$PscpPath        = "pscp.exe"           # albo pełna ścieżka: C:\Tools\PuTTY\pscp.exe
-$ConnectTimeout  = 10                   # sekundy
-# ==========================
+# =========================
+# CONFIG (edit these lines)
+# =========================
+$DevicesFileName = "devices.txt"          # one IP/host per line
+$LocalFileName   = "payload.bin"          # file located in the script folder
+$RemotePath      = "/var/tmp/payload.bin" # destination path on the device
+$PscpPath        = "pscp.exe"             # or full path e.g. C:\Tools\PuTTY\pscp.exe
+$ConnectTimeout  = 10                     # seconds
+# =========================
 
+# Resolve paths relative to the script location
 $ScriptDir   = Split-Path -Parent $PSCommandPath
 $DevicesPath = Join-Path $ScriptDir $DevicesFileName
 $LocalPath   = Join-Path $ScriptDir $LocalFileName
 
-if (-not (Test-Path $DevicesPath)) { throw "Brak pliku z hostami: $DevicesPath" }
-if (-not (Test-Path $LocalPath))   { throw "Brak pliku do skopiowania: $LocalPath" }
+if (-not (Test-Path -LiteralPath $DevicesPath)) { throw "Missing devices list file: $DevicesPath" }
+if (-not (Test-Path -LiteralPath $LocalPath))   { throw "Missing local file to copy: $LocalPath" }
 
-# Sprawdź czy pscp jest dostępny
+# Verify pscp exists
 try { $null = Get-Command $PscpPath -ErrorAction Stop }
-catch { throw "Nie znaleziono pscp.exe. Dodaj PuTTY do PATH albo ustaw pełną ścieżkę w `$PscpPath`." }
+catch { throw "pscp.exe not found. Add PuTTY to PATH or set `$PscpPath` to a full path." }
 
-# Wczytaj listę urządzeń
+# Load devices (ignore empty lines and lines starting with #)
 $Devices = Get-Content -LiteralPath $DevicesPath |
     ForEach-Object { $_.Trim() } |
     Where-Object { $_ -and -not $_.StartsWith("#") } |
     Sort-Object -Unique
 
-if (-not $Devices -or $Devices.Count -eq 0) { throw "devices.txt jest pusty (albo same komentarze)." }
+if (-not $Devices -or $Devices.Count -eq 0) { throw "No devices found in $DevicesPath" }
 
-# Zapytaj raz o dane
-$username = Read-Host "Podaj login SSH"
-$securePass = Read-Host "Podaj hasło SSH (będzie użyte przez pscp -pw)" -AsSecureString
-$password = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePass)
+# Prompt once for credentials
+$Username   = Read-Host "Enter SSH username"
+$SecurePass = Read-Host "Enter SSH password (will be passed to pscp -pw)" -AsSecureString
+$Password   = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePass)
 )
 
-if ([string]::IsNullOrWhiteSpace($username) -or [string]::IsNullOrWhiteSpace($password)) {
-    throw "Login/hasło nie może być puste."
+if ([string]::IsNullOrWhiteSpace($Username) -or [string]::IsNullOrWhiteSpace($Password)) {
+    throw "Username/password cannot be empty."
 }
 
-# Przygotuj logi
+# Output logs
 $RunStamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $OutDir   = Join-Path $ScriptDir "out_$RunStamp"
-New-Item -ItemType Directory -Path $OutDir | Out-Null
+New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
 $CsvPath = Join-Path $OutDir "results.csv"
 $ErrLog  = Join-Path $OutDir "errors.log"
 
 $results = New-Object System.Collections.Generic.List[object]
 
-Write-Host "Start: kopiuję '$LocalFileName' do $($Devices.Count) urządzeń (1 po drugim)..." -ForegroundColor Cyan
+Write-Host "Starting SCP copy to $($Devices.Count) devices (sequential)..." -ForegroundColor Cyan
+Write-Host "Local file : $LocalPath"
 Write-Host "Remote path: $RemotePath"
-Write-Host "Logi: $OutDir"
+Write-Host "Output dir : $OutDir"
 Write-Host ""
 
-foreach ($d in $Devices) {
+foreach ($Device in $Devices) {
     $start = Get-Date
-    Write-Host "[$($start.ToString("HH:mm:ss"))] $d ..." -NoNewline
+    Write-Host "[$($start.ToString('HH:mm:ss'))] $Device ..." -NoNewline
 
-    $status = "UNKNOWN"
-    $msg = ""
+    $status   = "UNKNOWN"
+    $message  = ""
     $exitCode = $null
 
     try {
-        # (opcjonalnie) szybki test portu 22 – nie przerywa całości jak brak, tylko zapisuje błąd
-        $t = Test-NetConnection -ComputerName $d -Port 22 -WarningAction SilentlyContinue
+        # Optional: quick port 22 test
+        $t = Test-NetConnection -ComputerName $Device -Port 22 -WarningAction SilentlyContinue
         if (-not $t.TcpTestSucceeded) {
             throw "Port 22 unreachable"
         }
 
+        # Build pscp arguments
         $args = @(
-            "-batch",                 # bez interakcji
-            "-pw", $password,         # UWAGA: hasło w argumentach procesu
-            "-l", $username,
+            "-batch",                  # no interactive prompts
+            "-pw", $Password,          # WARNING: password in process arguments (accepted by user)
+            "-l",  $Username,
             "-timeout", "$ConnectTimeout",
             $LocalPath,
-            "$d`:$RemotePath"
+            "$Device`:$RemotePath"
         )
 
         $p = Start-Process -FilePath $PscpPath -ArgumentList $args -NoNewWindow -Wait -PassThru
         $exitCode = $p.ExitCode
 
         if ($exitCode -eq 0) {
-            $status = "OK"
-            $msg = "Copied"
+            $status  = "OK"
+            $message = "Copied"
             Write-Host " OK" -ForegroundColor Green
         } else {
-            $status = "FAILED"
-            $msg = "pscp exit code $exitCode"
+            $status  = "FAILED"
+            $message = "pscp exit code $exitCode"
             Write-Host " FAILED" -ForegroundColor Red
         }
     }
     catch {
-        $status = "FAILED"
-        $msg = $_.Exception.Message
+        $status  = "FAILED"
+        $message = $_.Exception.Message
         Write-Host " FAILED" -ForegroundColor Red
     }
 
@@ -101,26 +106,27 @@ foreach ($d in $Devices) {
     $sec = [math]::Round(($end - $start).TotalSeconds, 2)
 
     $results.Add([pscustomobject]@{
-        device     = $d
-        status     = $status
-        exit_code  = $exitCode
-        seconds    = $sec
-        message    = $msg
-        started_at = $start.ToString("s")
-        finished_at= $end.ToString("s")
+        device      = $Device
+        status      = $status
+        exit_code   = $exitCode
+        seconds     = $sec
+        message     = $message
+        started_at  = $start.ToString("s")
+        finished_at = $end.ToString("s")
     }) | Out-Null
 
     if ($status -ne "OK") {
-        "{0} | {1} | {2}" -f $end.ToString("s"), $d, $msg | Add-Content -Encoding UTF8 -Path $ErrLog
+        "{0} | {1} | {2}" -f $end.ToString("s"), $Device, $message |
+            Add-Content -Encoding UTF8 -LiteralPath $ErrLog
     }
 }
 
-$results | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $CsvPath
+$results | Export-Csv -NoTypeInformation -Encoding UTF8 -LiteralPath $CsvPath
 
 $ok   = ($results | Where-Object status -eq "OK").Count
 $fail = ($results | Where-Object status -ne "OK").Count
 
 Write-Host ""
 Write-Host "DONE. OK=$ok FAILED=$fail" -ForegroundColor Cyan
-Write-Host "CSV: $CsvPath"
-Write-Host "ERR: $ErrLog"
+Write-Host "Results CSV : $CsvPath"
+Write-Host "Errors log  : $ErrLog"
