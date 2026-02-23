@@ -2,14 +2,14 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # =========================
-# CONFIG (edit if needed)
+# CONFIG (set once and forget)
 # =========================
 $DevicesFileName = "devices.txt"          # one IP/host per line
 $LocalFileName   = "payload.bin"          # file located in the script folder
 $RemotePath      = "/var/tmp/payload.bin" # destination path on the device
-$PscpPath        = "pscp.exe"             # or full path: C:\Tools\PuTTY\pscp.exe
-$Port            = 22                     # SSH port
-$ForceSftp       = $false                 # set $true if SCP is flaky; pscp supports -sftp
+$PscpPath        = "pscp.exe"             # or full path to pscp.exe
+$Port            = 22
+$Protocol        = "scp"                  # "scp" or "sftp"
 # =========================
 
 function ConvertTo-PlainText([Security.SecureString]$Secure) {
@@ -18,7 +18,7 @@ function ConvertTo-PlainText([Security.SecureString]$Secure) {
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 }
 
-function Invoke-PscpCopy {
+function Invoke-Pscp {
     param(
         [string]$PscpPath,
         [string]$Device,
@@ -27,28 +27,27 @@ function Invoke-PscpCopy {
         [string]$Password,
         [string]$LocalPath,
         [string]$RemotePath,
-        [string]$HostKey,          # optional
-        [bool]$ForceSftp
+        [string]$Protocol,
+        [string]$HostKeyFingerprint # optional
     )
 
-    # Build argument list
     $args = New-Object System.Collections.Generic.List[string]
     $args.Add("-batch")
+    $args.Add("-no-sanitise-stderr")
     $args.Add("-P");  $args.Add("$Port")
     $args.Add("-l");  $args.Add($Username)
     $args.Add("-pw"); $args.Add($Password)
 
-    if ($ForceSftp) { $args.Add("-sftp") }
+    if ($Protocol -eq "sftp") { $args.Add("-sftp") } else { $args.Add("-scp") }
 
-    if ($HostKey) {
+    if ($HostKeyFingerprint) {
         $args.Add("-hostkey")
-        $args.Add($HostKey)
+        $args.Add($HostKeyFingerprint)
     }
 
     $args.Add($LocalPath)
     $args.Add("$Device`:$RemotePath")
 
-    # Run pscp and capture stdout/stderr properly
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $PscpPath
     $psi.Arguments = ($args -join " ")
@@ -59,21 +58,35 @@ function Invoke-PscpCopy {
 
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo = $psi
-
     [void]$p.Start()
+
     $stdout = $p.StandardOutput.ReadToEnd()
     $stderr = $p.StandardError.ReadToEnd()
+
     $p.WaitForExit()
 
-    return [pscustomobject]@{
+    [pscustomobject]@{
         ExitCode = $p.ExitCode
         StdOut   = $stdout
         StdErr   = $stderr
-        CmdLine  = $psi.Arguments
+        Args     = $psi.Arguments
     }
 }
 
-# Resolve script directory + paths
+function Extract-HostKeyFingerprint {
+    param([string]$Text)
+
+    # Example lines from PuTTY/pscp:
+    # "The server's ssh-ed25519 key fingerprint is:"
+    # "ssh-ed25519 255 SHA256:....."
+    #
+    # This regex finds the first line starting with "ssh-" that contains "SHA256:"
+    $m = [regex]::Match($Text, "(?im)^\s*(ssh-[a-z0-9-]+\s+\d+\s+SHA256:[A-Za-z0-9+/=]+)\s*$")
+    if ($m.Success) { return $m.Groups[1].Value.Trim() }
+    return $null
+}
+
+# Paths relative to script location
 $ScriptDir   = Split-Path -Parent $PSCommandPath
 $DevicesPath = Join-Path $ScriptDir $DevicesFileName
 $LocalPath   = Join-Path $ScriptDir $LocalFileName
@@ -82,9 +95,8 @@ if (-not (Test-Path -LiteralPath $DevicesPath)) { throw "Missing devices list fi
 if (-not (Test-Path -LiteralPath $LocalPath))   { throw "Missing local file to copy: $LocalPath" }
 
 try { $null = Get-Command $PscpPath -ErrorAction Stop }
-catch { throw "pscp.exe not found. Add PuTTY to PATH or set `$PscpPath` to a full path." }
+catch { throw "pscp.exe not found. Put it in PATH or set `$PscpPath` to a full path." }
 
-# Load devices (ignore empty lines and comments)
 $Devices = Get-Content -LiteralPath $DevicesPath |
     ForEach-Object { $_.Trim() } |
     Where-Object { $_ -and -not $_.StartsWith("#") } |
@@ -92,7 +104,7 @@ $Devices = Get-Content -LiteralPath $DevicesPath |
 
 if (-not $Devices -or $Devices.Count -eq 0) { throw "No devices found in $DevicesPath" }
 
-# Prompt once for credentials
+# Prompt ONCE
 $Username   = Read-Host "Enter SSH username"
 $SecurePass = Read-Host "Enter SSH password (will be passed to pscp -pw)" -AsSecureString
 $Password   = ConvertTo-PlainText $SecurePass
@@ -101,7 +113,7 @@ if ([string]::IsNullOrWhiteSpace($Username) -or [string]::IsNullOrWhiteSpace($Pa
     throw "Username/password cannot be empty."
 }
 
-# Logging outputs
+# Output
 $RunStamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $OutDir   = Join-Path $ScriptDir "out_$RunStamp"
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
@@ -111,10 +123,10 @@ $ErrLog  = Join-Path $OutDir "errors.log"
 
 $results = New-Object System.Collections.Generic.List[object]
 
-Write-Host "Starting SCP copy to $($Devices.Count) devices (sequential)..." -ForegroundColor Cyan
+Write-Host "Starting copy to $($Devices.Count) devices (sequential)..." -ForegroundColor Cyan
+Write-Host "Protocol   : $Protocol"
 Write-Host "Local file : $LocalPath"
 Write-Host "Remote path: $RemotePath"
-Write-Host "pscp       : $PscpPath (PuTTY 0.76 compatible)"
 Write-Host "Output dir : $OutDir"
 Write-Host ""
 
@@ -122,59 +134,62 @@ foreach ($Device in $Devices) {
     $start = Get-Date
     Write-Host "[$($start.ToString('HH:mm:ss'))] $Device ..." -NoNewline
 
-    $status   = "UNKNOWN"
-    $message  = ""
-    $exitCode = $null
-    $usedHostKey = $null
+    $status = "UNKNOWN"
+    $exit   = $null
+    $msg    = ""
+    $stderrFinal = ""
+    $hostKeyUsed = $null
 
     try {
-        # Optional: quick port check
+        # Optional quick port check
         $t = Test-NetConnection -ComputerName $Device -Port $Port -WarningAction SilentlyContinue
-        if (-not $t.TcpTestSucceeded) {
-            throw "Port $Port unreachable"
-        }
+        if (-not $t.TcpTestSucceeded) { throw "Port $Port unreachable" }
 
-        # 1st attempt (no hostkey)
-        $r1 = Invoke-PscpCopy -PscpPath $PscpPath -Device $Device -Port $Port -Username $Username -Password $Password `
-                              -LocalPath $LocalPath -RemotePath $RemotePath -HostKey $null -ForceSftp:$ForceSftp
+        # Attempt 1 (no hostkey)
+        $r1 = Invoke-Pscp -PscpPath $PscpPath -Device $Device -Port $Port -Username $Username -Password $Password `
+                          -LocalPath $LocalPath -RemotePath $RemotePath -Protocol $Protocol -HostKeyFingerprint $null
 
         if ($r1.ExitCode -eq 0) {
             $status = "OK"
-            $message = "Copied"
-            $exitCode = 0
+            $exit = 0
+            $msg = "Copied"
+            $stderrFinal = $r1.StdErr
             Write-Host " OK" -ForegroundColor Green
         }
         else {
-            # If host key not cached, parse fingerprint and retry with -hostkey
-            if ($r1.StdErr -match "The server's .* key fingerprint is:\s*\r?\n\s*(?<fp>ssh-[^\r\n]+)") {
-                $usedHostKey = $Matches["fp"].Trim()
+            # If hostkey not cached, extract fingerprint and retry with -hostkey
+            $fp = Extract-HostKeyFingerprint -Text ($r1.StdErr + "`n" + $r1.StdOut)
+            if ($fp) {
+                $hostKeyUsed = $fp
 
-                $r2 = Invoke-PscpCopy -PscpPath $PscpPath -Device $Device -Port $Port -Username $Username -Password $Password `
-                                      -LocalPath $LocalPath -RemotePath $RemotePath -HostKey $usedHostKey -ForceSftp:$ForceSftp
+                $r2 = Invoke-Pscp -PscpPath $PscpPath -Device $Device -Port $Port -Username $Username -Password $Password `
+                                  -LocalPath $LocalPath -RemotePath $RemotePath -Protocol $Protocol -HostKeyFingerprint $fp
 
-                $exitCode = $r2.ExitCode
+                $exit = $r2.ExitCode
+                $stderrFinal = $r2.StdErr
 
                 if ($r2.ExitCode -eq 0) {
                     $status = "OK"
-                    $message = "Copied (auto hostkey)"
+                    $msg = "Copied (auto hostkey)"
                     Write-Host " OK" -ForegroundColor Green
                 } else {
                     $status = "FAILED"
-                    $message = "pscp failed after hostkey retry. ExitCode=$($r2.ExitCode). Err=$($r2.StdErr.Trim())"
+                    $msg = "pscp exit code $($r2.ExitCode)"
                     Write-Host " FAILED" -ForegroundColor Red
                 }
             }
             else {
                 $status = "FAILED"
-                $exitCode = $r1.ExitCode
-                $message = "pscp failed. ExitCode=$($r1.ExitCode). Err=$($r1.StdErr.Trim())"
+                $exit = $r1.ExitCode
+                $msg = "pscp exit code $($r1.ExitCode)"
+                $stderrFinal = $r1.StdErr
                 Write-Host " FAILED" -ForegroundColor Red
             }
         }
     }
     catch {
         $status = "FAILED"
-        $message = $_.Exception.Message
+        $msg = $_.Exception.Message
         Write-Host " FAILED" -ForegroundColor Red
     }
 
@@ -184,17 +199,19 @@ foreach ($Device in $Devices) {
     $results.Add([pscustomobject]@{
         device       = $Device
         status       = $status
+        exit_code    = $exit
         seconds      = $sec
-        message      = $message
-        auto_hostkey = [bool]($usedHostKey)
-        hostkey      = $usedHostKey
+        message      = $msg
+        auto_hostkey = [bool]$hostKeyUsed
+        hostkey      = $hostKeyUsed
+        stderr       = ($stderrFinal -replace "\r","" -replace "\n"," | ").Trim()
         started_at   = $start.ToString("s")
         finished_at  = $end.ToString("s")
     }) | Out-Null
 
     if ($status -ne "OK") {
-        "{0} | {1} | {2}" -f $end.ToString("s"), $Device, $message |
-            Add-Content -Encoding UTF8 -LiteralPath $ErrLog
+        $line = "{0} | {1} | exit={2} | {3}" -f $end.ToString("s"), $Device, $exit, ($stderrFinal.Trim())
+        Add-Content -Encoding UTF8 -LiteralPath $ErrLog -Value $line
     }
 }
 
