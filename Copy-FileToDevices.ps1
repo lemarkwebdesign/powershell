@@ -4,12 +4,12 @@ $ErrorActionPreference = "Stop"
 # =========================
 # CONFIG (set once and forget)
 # =========================
-$DevicesFileName = "devices.txt"          # one IP/host per line
-$LocalFileName   = "payload.bin"          # file in the script folder
-$RemotePath      = "/var/tmp/payload.bin" # destination path on the device
-$PscpPath        = "pscp.exe"             # or full path to pscp.exe
+$DevicesFileName = "devices.txt"
+$LocalFileName   = "payload.bin"
+$RemotePath      = "/var/tmp/payload.bin"
+$PscpPath        = "pscp.exe"
 $Port            = 22
-$Protocol        = "scp"                  # "scp" or "sftp"
+$Protocol        = "scp"   # "scp" or "sftp"
 # =========================
 
 function ConvertTo-PlainText([Security.SecureString]$Secure) {
@@ -29,11 +29,6 @@ function Invoke-PscpWithAutoYes {
         [string]$RemotePath,
         [string]$Protocol
     )
-
-    # NOTE:
-    # - We intentionally do NOT use -batch, because we want to auto-answer
-    #   "Store key in cache? (y/n)" on first contact.
-    # - We DO pass -pw to avoid password prompts.
 
     $args = New-Object System.Collections.Generic.List[string]
     $args.Add("-v")
@@ -60,8 +55,7 @@ function Invoke-PscpWithAutoYes {
     $p.StartInfo = $psi
     [void]$p.Start()
 
-    # Always send "y" once. If prompt appears, this accepts & stores the key.
-    # If prompt does not appear, it is ignored.
+    # Auto-accept first-time host key prompt
     $p.StandardInput.WriteLine("y")
     $p.StandardInput.Close()
 
@@ -77,7 +71,7 @@ function Invoke-PscpWithAutoYes {
     }
 }
 
-# Resolve paths relative to script location
+# Paths relative to the script location
 $ScriptDir   = Split-Path -Parent $PSCommandPath
 $DevicesPath = Join-Path $ScriptDir $DevicesFileName
 $LocalPath   = Join-Path $ScriptDir $LocalFileName
@@ -88,13 +82,15 @@ if (-not (Test-Path -LiteralPath $LocalPath))   { throw "Missing local file to c
 try { $null = Get-Command $PscpPath -ErrorAction Stop }
 catch { throw "pscp.exe not found. Put it in PATH or set `$PscpPath` to a full path." }
 
-# Load devices
-$Devices = Get-Content -LiteralPath $DevicesPath |
-    ForEach-Object { $_.Trim() } |
-    Where-Object { $_ -and -not $_.StartsWith("#") } |
-    Sort-Object -Unique
+# Load devices (ALWAYS as an array to avoid StrictMode Count issues)
+$Devices = @(
+    Get-Content -LiteralPath $DevicesPath |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and -not $_.StartsWith("#") } |
+        Sort-Object -Unique
+)
 
-if (-not $Devices -or $Devices.Count -eq 0) { throw "No devices found in $DevicesPath" }
+if ($Devices.Count -eq 0) { throw "No devices found in $DevicesPath" }
 
 # Prompt once for credentials
 $Username   = Read-Host "Enter SSH username"
@@ -132,7 +128,6 @@ foreach ($Device in $Devices) {
     $stderrFinal = ""
 
     try {
-        # Optional port check
         $t = Test-NetConnection -ComputerName $Device -Port $Port -WarningAction SilentlyContinue
         if (-not $t.TcpTestSucceeded) { throw "Port $Port unreachable" }
 
